@@ -16,6 +16,12 @@ export const OCT = SQ2 - 1;
 /** @constant {number} Maximum supported agents in the simulation pool */
 export const MAX_AGENTS = 20_000;
 
+/** @constant {number} Maximum supported chunks (24 x 18) in shared memory */
+export const MAX_CHUNKS = 24 * 18;
+
+/** @constant {number} Maximum supported portals in shared memory */
+export const MAX_PORTALS = 4096;
+
 /** @constant {number} Fixed physics integration timestep (60 Hz) */
 export const FIXED_DT = 1 / 60;
 
@@ -39,6 +45,44 @@ export const DY = [0, 0, 1, -1, 1, 1, -1, -1];
 
 /** @constant {number[]} 8-way neighbor step lengths */
 export const DL = [1, 1, 1, 1, SQ2, SQ2, SQ2, SQ2];
+
+/**
+ * Atomic control register indices inside `SharedArena.ctrlI32`.
+ * @enum {number}
+ */
+export const CTRL = Object.freeze({
+  SEQ: 0,
+  PAUSED: 1,
+  FRAME: 2,
+  AGENT_COUNT: 3,
+  ARRIVED_COUNT: 4,
+  ACTIVE_CHUNKS: 5,
+  FLOW_CACHE_COUNT: 6,
+  SIM_DURATION_US: 7,
+  GOAL_X: 8,
+  GOAL_Y: 9,
+  GOAL_CHUNK: 10,
+  SELECTED_ID: 11,
+  EVENTS: 12,
+  GRID_VERSION: 13,
+  GRAPH_VERSION: 14,
+  AUTOGOAL_REM_MS: 15,
+  SEL_CHUNKS_LEN: 16,
+  SEL_PORTALS_LEN: 17,
+  WORKER_TICKS: 18,
+  CHUNKS_X: 19,
+  CHUNKS_Y: 20
+});
+
+/**
+ * Atomic event bitmask flags stored in `CTRL.EVENTS`.
+ * @enum {number}
+ */
+export const EVENTS = Object.freeze({
+  GOAL: 1 << 0,
+  ARRIVAL: 1 << 1,
+  GRAPH_REBUILT: 1 << 2
+});
 
 /**
  * Clamps a numeric value within an inclusive [min, max] range.
@@ -73,24 +117,153 @@ export const mulberry32 = s => () => {
 };
 //#endregion
 
-//#region 2: PriorityQueuesAndContainers
+//#region 2: SharedMemoryArenaAndAtomics
+/**
+ * Contiguous `SharedArrayBuffer` arena and `Atomics` synchronization layer
+ * backing agents, terrain costs, active chunk flow fields, and telemetry registers.
+ */
+export class SharedArena {
+  /**
+   * @param {SharedArrayBuffer|ArrayBuffer} [existingBuffer] - Optional pre-allocated buffer.
+   */
+  constructor(existingBuffer = null) {
+    let offset = 0;
+    const align8 = n => (n + 7) & ~7;
+    const reserve = (BytesPerEl, len) => {
+      const start = offset;
+      offset = align8(offset + BytesPerEl * len);
+      return [start, len];
+    };
+
+    const sCtrl = reserve(4, 64);
+    const sPx = reserve(4, MAX_AGENTS), sPy = reserve(4, MAX_AGENTS);
+    const sVx = reserve(4, MAX_AGENTS), sVy = reserve(4, MAX_AGENTS);
+    const sSepX = reserve(4, MAX_AGENTS), sSepY = reserve(4, MAX_AGENTS);
+    const sCorrX = reserve(4, MAX_AGENTS), sCorrY = reserve(4, MAX_AGENTS);
+    const sRepath = reserve(4, MAX_AGENTS);
+    const sPathIdx = reserve(4, MAX_AGENTS), sGoalCell = reserve(4, MAX_AGENTS);
+    const sState = reserve(1, MAX_AGENTS), sQueued = reserve(1, MAX_AGENTS), sTouching = reserve(1, MAX_AGENTS);
+    const sGridCosts = reserve(1, MAX_CHUNKS * CC);
+    const sActStamp = reserve(4, MAX_CHUNKS), sActKind = reserve(1, MAX_CHUNKS);
+    const sActInt = reserve(4, MAX_CHUNKS * CC);
+    const sActFX = reserve(4, MAX_CHUNKS * CC), sActFY = reserve(4, MAX_CHUNKS * CC);
+    const sPortTargets = reserve(4, MAX_PORTALS), sPortOnPath = reserve(1, MAX_PORTALS);
+    const sSelChunks = reserve(4, 512), sSelPortals = reserve(4, 512), sSelGoal = reserve(4, 2);
+
+    this.totalBytes = offset;
+    if (existingBuffer) {
+      this.buffer = existingBuffer;
+    } else if (typeof SharedArrayBuffer !== 'undefined' && (typeof window === 'undefined' || window.crossOriginIsolated)) {
+      this.buffer = new SharedArrayBuffer(this.totalBytes);
+    } else {
+      this.buffer = new ArrayBuffer(this.totalBytes);
+    }
+    this.isShared = typeof SharedArrayBuffer !== 'undefined' && (this.buffer instanceof SharedArrayBuffer);
+
+    const B = this.buffer;
+    this.ctrlI32 = new Int32Array(B, sCtrl[0], sCtrl[1]);
+    this.px = new Float32Array(B, sPx[0], sPx[1]);
+    this.py = new Float32Array(B, sPy[0], sPy[1]);
+    this.vx = new Float32Array(B, sVx[0], sVx[1]);
+    this.vy = new Float32Array(B, sVy[0], sVy[1]);
+    this.sepX = new Float32Array(B, sSepX[0], sSepX[1]);
+    this.sepY = new Float32Array(B, sSepY[0], sSepY[1]);
+    this.corrX = new Float32Array(B, sCorrX[0], sCorrX[1]);
+    this.corrY = new Float32Array(B, sCorrY[0], sCorrY[1]);
+    this.repathCd = new Float32Array(B, sRepath[0], sRepath[1]);
+    this.pathIdx = new Int32Array(B, sPathIdx[0], sPathIdx[1]);
+    this.goalCell = new Int32Array(B, sGoalCell[0], sGoalCell[1]);
+    this.state = new Uint8Array(B, sState[0], sState[1]);
+    this.queued = new Uint8Array(B, sQueued[0], sQueued[1]);
+    this.touching = new Uint8Array(B, sTouching[0], sTouching[1]);
+    this.gridCosts = new Uint8Array(B, sGridCosts[0], sGridCosts[1]);
+    this.activeStamp = new Int32Array(B, sActStamp[0], sActStamp[1]);
+    this.activeKind = new Uint8Array(B, sActKind[0], sActKind[1]);
+    this.activeIntegration = new Float32Array(B, sActInt[0], sActInt[1]);
+    this.activeFlowX = new Float32Array(B, sActFX[0], sActFX[1]);
+    this.activeFlowY = new Float32Array(B, sActFY[0], sActFY[1]);
+    this.portalTargets = new Int32Array(B, sPortTargets[0], sPortTargets[1]);
+    this.portalOnPath = new Uint8Array(B, sPortOnPath[0], sPortOnPath[1]);
+    this.selPathChunks = new Int32Array(B, sSelChunks[0], sSelChunks[1]);
+    this.selPathPortals = new Int32Array(B, sSelPortals[0], sSelPortals[1]);
+    this.selPathGoal = new Float32Array(B, sSelGoal[0], sSelGoal[1]);
+  }
+
+  /**
+   * Atomically loads a 32-bit integer register.
+   * @param {number} idx - Register index from `CTRL`.
+   * @returns {number} Register value.
+   */
+  load(idx) { return Atomics.load(this.ctrlI32, idx); }
+
+  /**
+   * Atomically stores a 32-bit integer register.
+   * @param {number} idx - Register index from `CTRL`.
+   * @param {number} val - Value to store.
+   */
+  store(idx, val) { Atomics.store(this.ctrlI32, idx, val | 0); }
+
+  /**
+   * Atomically adds `delta` to a register.
+   * @param {number} idx - Register index from `CTRL`.
+   * @param {number} delta - Integer delta.
+   * @returns {number} Previous register value.
+   */
+  add(idx, delta) { return Atomics.add(this.ctrlI32, idx, delta | 0); }
+
+  /**
+   * Atomically sets bitmask flags in `CTRL.EVENTS`.
+   * @param {number} mask - Bitmask from `EVENTS`.
+   */
+  raiseEvent(mask) { Atomics.or(this.ctrlI32, CTRL.EVENTS, mask | 0); }
+
+  /**
+   * Atomically reads and clears all pending event flags in `CTRL.EVENTS`.
+   * @returns {number} Consumed bitmask.
+   */
+  consumeEvents() { return Atomics.exchange(this.ctrlI32, CTRL.EVENTS, 0); }
+
+  /** Begins a SeqLock write section (increments `CTRL.SEQ` to odd). */
+  beginWrite() { Atomics.add(this.ctrlI32, CTRL.SEQ, 1); }
+
+  /** Ends a SeqLock write section (increments `CTRL.SEQ` to even and notifies waiters). */
+  endWrite() {
+    Atomics.add(this.ctrlI32, CTRL.SEQ, 1);
+    if (this.isShared) Atomics.notify(this.ctrlI32, CTRL.SEQ, 1);
+  }
+
+  /**
+   * Executes `fn` inside a lock-free SeqLock read loop to guarantee tear-free telemetry reads.
+   * @template T
+   * @param {() => T} fn - Reader callback.
+   * @returns {T} Consistent snapshot result.
+   */
+  readConsistent(fn) {
+    for (let tries = 0; tries < 8; tries++) {
+      const s0 = Atomics.load(this.ctrlI32, CTRL.SEQ);
+      if (s0 & 1) continue;
+      const res = fn();
+      const s1 = Atomics.load(this.ctrlI32, CTRL.SEQ);
+      if (s0 === s1) return res;
+    }
+    return fn();
+  }
+}
+//#endregion
+
+//#region 3: PriorityQueuesAndContainers
 /**
  * Pre-allocated FIFO integer queue for agent pathfinding requests.
  */
 export class RequestQueue {
-  /** @param {number} cap - Maximum capacity of the queue. */
   constructor(cap) {
     this.q = new Int32Array(cap);
     this.head = 0;
     this.tail = 0;
   }
-  /** @returns {number} Number of pending elements in the queue. */
   get length() { return this.tail - this.head; }
-  /** @param {number} val - Integer value to enqueue. */
   push(val) { this.q[this.tail++] = val; }
-  /** @returns {number} Dequeued integer or -1. */
   pop() { return this.head < this.tail ? this.q[this.head++] : -1; }
-  /** Resets queue pointers to empty. */
   clear() { this.head = this.tail = 0; }
 }
 
@@ -98,21 +271,13 @@ export class RequestQueue {
  * Binary min-heap backed by TypedArrays for A* and Dijkstra searches.
  */
 export class MinHeap {
-  /** @param {number} [cap=128] - Initial heap capacity. */
   constructor(cap = 128) {
     this.it = new Int32Array(cap);
     this.k = new Float64Array(cap);
     this.sz = this.lastKey = 0;
   }
-  /** @returns {boolean} True if the heap contains no elements. */
   get isEmpty() { return !this.sz; }
-  /** Clears all elements from the heap. */
   clear() { this.sz = 0; }
-  /**
-   * Inserts an item with an associated priority key into the heap.
-   * @param {number} item - Node identifier.
-   * @param {number} key - Priority value (smaller popped first).
-   */
   push(item, key) {
     let { it, k, sz } = this;
     if (sz === it.length) {
@@ -127,10 +292,6 @@ export class MinHeap {
     }
     it[c] = item; k[c] = key;
   }
-  /**
-   * Removes and returns the item with the minimum priority key.
-   * @returns {number} Minimum item identifier.
-   */
   pop() {
     let { it, k } = this, top = it[0], li = --this.sz, item = it[li], key = k[li], p = 0, ch;
     this.lastKey = k[0];
@@ -145,44 +306,42 @@ export class MinHeap {
 }
 //#endregion
 
-//#region 3: GridWorldDomain
+//#region 4: GridWorldDomain
 /**
  * Represents the 2D uniform cost grid partitioned into CS x CS chunks.
+ * Can be backed directly by a `SharedArena` slice.
  */
 export class GridWorld {
   /**
    * @param {number} cx - Number of chunks horizontally.
    * @param {number} cy - Number of chunks vertically.
+   * @param {SharedArena|null} [arena=null] - Optional shared memory arena.
    */
-  constructor(cx, cy) {
+  constructor(cx, cy, arena = null) {
     this.cx = cx; this.cy = cy;
     this.width = cx * CS; this.height = cy * CS;
     this.chunkCount = cx * cy; this.version = 0;
-    this.costs = new Uint8Array(this.width * this.height).fill(COST_OPEN);
+    this.arena = arena;
+    const len = this.width * this.height;
+    this.costs = arena ? arena.gridCosts.subarray(0, len) : new Uint8Array(len);
+    this.costs.fill(COST_OPEN);
+    if (arena) {
+      arena.store(CTRL.CHUNKS_X, cx);
+      arena.store(CTRL.CHUNKS_Y, cy);
+      arena.store(CTRL.GRID_VERSION, 0);
+    }
   }
-  /** @returns {number} Flat cell index. */
   index(x, y) { return y * this.width + x; }
-  /** @returns {boolean} True if in bounds. */
   inBounds(x, y) { return x >= 0 && y >= 0 && x < this.width && y < this.height; }
-  /** @returns {boolean} True if walkable. */
   isWalkable(x, y) { return this.inBounds(x, y) && this.costs[this.index(x, y)] < COST_BLOCK; }
-  /** @returns {number} Chunk index. */
   chunkIdAt(x, y) { return (y / CS | 0) * this.cx + (x / CS | 0); }
-  /** @returns {number} World X coordinate of chunk's top-left corner. */
   chunkOriginX(c) { return (c % this.cx) * CS; }
-  /** @returns {number} World Y coordinate of chunk's top-left corner. */
   chunkOriginY(c) { return (c / this.cx | 0) * CS; }
-  /** @returns {number} Local cell index within its chunk. */
   localIndex(cell) { return ((cell / this.width | 0) % CS) * CS + (cell % this.width % CS); }
-  /** Increments the grid version counter to invalidate dependent caches. */
-  touchAll() { this.version++; }
-  /**
-   * Searches outward in concentric rings for the closest walkable cell.
-   * @param {number} x - Target X coordinate.
-   * @param {number} y - Target Y coordinate.
-   * @param {number} [maxR=24] - Maximum search radius in cells.
-   * @returns {number} Global cell index of nearest walkable cell, or -1 if none found.
-   */
+  touchAll() {
+    this.version++;
+    if (this.arena) this.arena.store(CTRL.GRID_VERSION, this.version);
+  }
   findNearestWalkable(x, y, maxR = 24) {
     const { width: W, height: H } = this, sx = clamp(x | 0, 0, W - 1), sy = clamp(y | 0, 0, H - 1);
     if (this.isWalkable(sx, sy)) return sy * W + sx;
@@ -208,7 +367,7 @@ export class GridWorld {
 }
 //#endregion
 
-//#region 4: PortalDetectionAndGeometry
+//#region 5: PortalDetectionAndGeometry
 /**
  * Scans all vertical and horizontal chunk boundaries to extract contiguous walkable portals.
  * @param {GridWorld} grid - The grid world to analyze.
@@ -250,21 +409,15 @@ export function detectPortals(grid) {
   return portals;
 }
 
-/** @returns {Int32Array} Array of global cell indices on chunk `c`'s side. */
 export const portalSideCells = (p, c) => c === p.chunkA ? p.cellsA : p.cellsB;
-/** @returns {number} Global cell index. */
 export const portalCenterCell = (p, c) => c === p.chunkA ? p.centerA : p.centerB;
-/** @returns {number} Exit X component (-1, 0, or 1). */
 export const portalExitX = (p, c) => p.isH ? 0 : c === p.chunkA ? 1 : -1;
-/** @returns {number} Exit Y component (-1, 0, or 1). */
 export const portalExitY = (p, c) => p.isH ? c === p.chunkA ? 1 : -1 : 0;
-/** @returns {number} Crossing cost. */
 export const crossingCost = (grid, p) => ((grid.costs[p.centerA] + grid.costs[p.centerB]) * 0.5) / COST_OPEN;
-/** @returns {number} Chunk-local cell index in [0, CC - 1]. */
 export const pLocal = (grid, p, c) => grid.localIndex(portalCenterCell(p, c));
 //#endregion
 
-//#region 5: ChunkEikonalIntegrator
+//#region 6: ChunkEikonalIntegrator
 /**
  * Computes 8-connected Dijkstra integration fields across a single CS x CS chunk.
  */
@@ -273,13 +426,6 @@ export class ChunkIntegrator {
   costs = new Uint8Array(CC);
   dist = new Float64Array(CC);
 
-  /**
-   * Integrates cost-weighted distances from `sources` across chunk `chunkId`.
-   * @param {GridWorld} grid - World grid.
-   * @param {number} chunkId - Target chunk ID.
-   * @param {ArrayLike<number>} sources - Local cell indices [0..255] acting as 0-distance sources.
-   * @param {Float32Array|Float64Array} out - Output array of length CC to receive integrated distances.
-   */
   integrate(grid, chunkId, sources, out) {
     const { costs, dist, heap } = this, ox = grid.chunkOriginX(chunkId), oy = grid.chunkOriginY(chunkId);
     for (let ly = 0, r = oy * grid.width + ox; ly < CS; ly++, r += grid.width) {
@@ -310,17 +456,12 @@ export class ChunkIntegrator {
 }
 //#endregion
 
-//#region 6: PortalGraphTopology
+//#region 7: PortalGraphTopology
 /**
  * High-level abstract graph connecting chunk boundary portals in CSR format.
  * Supports incremental O(1) reuse of unmodified chunk distance matrices.
  */
 export class PortalGraph {
-  /**
-   * @param {GridWorld} grid - The grid world for which to build the portal topology.
-   * @param {PortalGraph|null} [prevGraph=null] - Optional previous graph for incremental rebuilds.
-   * @param {Set<number>|null} [dirtyChunks=null] - Set of modified chunk IDs to re-integrate.
-   */
   constructor(grid, prevGraph = null, dirtyChunks = null) {
     this.grid = grid;
     const portals = this.portals = detectPortals(grid), P = portals.length;
@@ -366,18 +507,29 @@ export class PortalGraph {
       }
     }
   }
+
+  /**
+   * Exports a lightweight serializable snapshot of portals and CSR edges for Comlink transfer.
+   * @returns {Object} Serializable graph topology.
+   */
+  toSnapshot() {
+    return {
+      portals: this.portals.map(p => ({
+        id: p.id, uid: p.uid, isH: p.isH, start: p.start, border: p.border, end: p.end,
+        anchorX: p.anchorX, anchorY: p.anchorY
+      })),
+      edgeOffsets: this.edgeOffsets.slice(),
+      edgeTargets: this.edgeTargets.slice()
+    };
+  }
 }
 //#endregion
 
-//#region 7: MacroPathfinder
+//#region 8: MacroPathfinder
 /**
  * Hierarchical A* pathfinder operating over the `PortalGraph`.
  */
 export class MacroPathfinder {
-  /**
-   * @param {GridWorld} grid - World grid.
-   * @param {PortalGraph} graph - Precomputed portal graph.
-   */
   constructor(grid, graph) {
     this.grid = grid; this.graph = graph;
     const N = graph.portals.length + 2;
@@ -387,11 +539,6 @@ export class MacroPathfinder {
     this.startField = new Float64Array(CC); this.heap = new MinHeap(256); this.stamp = 0;
   }
 
-  /**
-   * Precomputes intra-chunk portal distances to a target goal cell.
-   * @param {number} cell - Global cell index of the goal.
-   * @returns {Object} Goal descriptor used by `findPath`.
-   */
   createGoal(cell) {
     const { grid, graph } = this, x = cell % grid.width, y = cell / grid.width | 0;
     const chunk = grid.chunkIdAt(x, y), field = new Float64Array(CC);
@@ -406,12 +553,6 @@ export class MacroPathfinder {
     return { cell, x, y, chunk, field, portalCost, graph };
   }
 
-  /**
-   * Finds an optimal sequence of portals and chunks from `startCell` to `goal`.
-   * @param {number} startCell - Global cell index of the agent's starting position.
-   * @param {Object} goal - Goal descriptor created via `createGoal`.
-   * @returns {Object|null} Path corridor object containing `portals` and `chunks`, or `null` if unreachable.
-   */
   findPath(startCell, goal) {
     const { grid, graph, g, parent, parentChunk, seen, closed, heap } = this;
     const P = graph.portals.length, START = P, GOAL = P + 1;
@@ -465,13 +606,7 @@ export class MacroPathfinder {
 }
 //#endregion
 
-//#region 8: FlowFieldAndBilinearSampler
-/**
- * Computes normalized 2D steering vectors (`flowX`, `flowY`) from a chunk's integration field.
- * @param {Object} f - Chunk flow field entry containing `integration`, `flowX`, and `flowY`.
- * @param {number} exX - Default exit X direction at zero-distance portal source cells.
- * @param {number} exY - Default exit Y direction at zero-distance portal source cells.
- */
+//#region 9: FlowFieldAndBilinearSampler
 export function computeFlowVectors(f, exX, exY) {
   const { integration: I, flowX: FX, flowY: FY } = f;
   const at = (x, y) => x >>> 0 >= CS || y >>> 0 >= CS ? Infinity : I[y * CS + x];
@@ -504,40 +639,25 @@ export function computeFlowVectors(f, exX, exY) {
   }
 }
 
-/**
- * Bounded cache of chunk-level integration and flow vector fields.
- */
 export class FlowFieldCache {
-  /**
-   * @param {GridWorld} grid - World grid.
-   * @param {number} [cap=2048] - Maximum cached flow fields before eviction.
-   */
   constructor(grid, cap = 2048) {
     this.grid = grid; this.cap = cap; this.entries = new Map();
     this.it = new ChunkIntegrator();
   }
-  /** @returns {number} Unique cache key. */
   key(c, kind, tid) { return (tid * 2 + (kind === 'g' ? 1 : 0)) * 65536 + c; }
-  /** @returns {Object} Flow field entry. */
   getPortalField(c, p) {
     const k = this.key(c, 'p', p.uid);
     const hit = this.entries.get(k);
     if (hit) return hit;
     return this.build(k, c, 'p', p.uid, portalSideCells(p, c).map(x => this.grid.localIndex(x)), portalExitX(p, c), portalExitY(p, c));
   }
-  /** @returns {Object} Flow field entry. */
   getGoalField(c, cell) {
     const k = this.key(c, 'g', cell);
     const hit = this.entries.get(k);
     if (hit) return hit;
     return this.build(k, c, 'g', cell, [this.grid.localIndex(cell)], 0, 0);
   }
-  /** Evicts all cached flow fields. */
   clear() { this.entries.clear(); }
-  /**
-   * Surgically evicts only cached flow fields belonging to chunks in `dirtyChunks`.
-   * @param {Set<number>} dirtyChunks - Set of modified chunk IDs.
-   */
   invalidateChunks(dirtyChunks) {
     for (const [k, f] of this.entries) {
       if (dirtyChunks.has(f.chunkId)) this.entries.delete(k);
@@ -560,23 +680,12 @@ export class FlowFieldCache {
   }
 }
 
-/**
- * Samples a chunk flow field at world position (px, py) using obstacle-aware bilinear interpolation.
- * @param {Object} f - Flow field entry.
- * @param {number} px - World X position.
- * @param {number} py - World Y position.
- * @param {{x: number, y: number}} out - Output vector object mutated with normalized direction.
- * @returns {boolean} True if a valid steering direction was sampled.
- */
 export function sampleFlowBilinear(f, px, py, out) {
   const lx = px - f.originX - 0.5, ly = py - f.originY - 0.5;
   const x0 = Math.floor(lx), y0 = Math.floor(ly);
   const tx = lx - x0, ty = ly - y0;
   const { integration: I, flowX: FX, flowY: FY } = f;
-  const w00 = (1 - tx) * (1 - ty);
-  const w10 = tx * (1 - ty);
-  const w01 = (1 - tx) * ty;
-  const w11 = tx * ty;
+  const w00 = (1 - tx) * (1 - ty), w10 = tx * (1 - ty), w01 = (1 - tx) * ty, w11 = tx * ty;
   const cx0 = x0 < 0 ? 0 : (x0 > 15 ? 15 : x0);
   const cx1 = (x0 + 1) < 0 ? 0 : ((x0 + 1) > 15 ? 15 : (x0 + 1));
   const cy0 = y0 < 0 ? 0 : (y0 > 15 ? 15 : y0);
@@ -598,10 +707,7 @@ export function sampleFlowBilinear(f, px, py, out) {
 }
 //#endregion
 
-//#region 9: ProceduralMapGenerator
-/**
- * Fills an axis-aligned rectangle of cells in `grid` with `cost`.
- */
+//#region 10: ProceduralMapGenerator
 export function fillRect(grid, x, y, w, h, cost) {
   const x0 = Math.max(0, x), x1 = Math.min(grid.width, x + w);
   for (let yy = Math.max(0, y), y1 = Math.min(grid.height, y + h); yy < y1; yy++) {
@@ -609,9 +715,6 @@ export function fillRect(grid, x, y, w, h, cost) {
   }
 }
 
-/**
- * Fills a circular disc of cells in `grid` with `cost`.
- */
 export function fillDisc(grid, cx, cy, r, cost) {
   const r2 = r * r, x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(grid.width - 1, Math.ceil(cx + r));
   const y0 = Math.max(0, Math.floor(cy - r)), y1 = Math.min(grid.height - 1, Math.ceil(cy + r));
@@ -625,10 +728,6 @@ export function fillDisc(grid, cx, cy, r, cost) {
   }
 }
 
-/**
- * Flood-fills the grid to identify connected walkable components and blocks all pockets
- * except the largest connected component.
- */
 export function removeDisconnectedPockets(grid) {
   const { width: W, costs } = grid, tot = costs.length;
   const label = new Int32Array(tot).fill(-1), queue = new Int32Array(tot);
@@ -651,9 +750,6 @@ export function removeDisconnectedPockets(grid) {
   for (let i = 0; i < tot; i++) if (label[i] !== -1 && label[i] !== best) costs[i] = COST_BLOCK;
 }
 
-/**
- * Procedurally populates a `GridWorld` based on a seed and architectural preset.
- */
 export function generateMap(grid, seed, { preset = 'The Grand Citadel', wallDensity = 1, mudDensity = 1 } = {}) {
   const rng = mulberry32(seed), { width: W, height: H } = grid, area = W * H;
   grid.costs.fill(COST_OPEN);
@@ -671,13 +767,9 @@ export function generateMap(grid, seed, { preset = 'The Grand Citadel', wallDens
   if (preset === 'The Grand Citadel') {
     const midX = W / 2 | 0, midY = H / 2 | 0;
     fillRect(grid, midX - 2, 0, 4, H, COST_BLOCK);
-    clr.push([midX - 3, midY - 6, 6, 12]);
-    clr.push([midX - 3, 4, 6, 8]);
-    clr.push([midX - 3, H - 12, 6, 8]);
+    clr.push([midX - 3, midY - 6, 6, 12], [midX - 3, 4, 6, 8], [midX - 3, H - 12, 6, 8]);
     fillRect(grid, 0, midY - 2, W, 4, COST_BLOCK);
-    clr.push([midX - 6, midY - 3, 12, 6]);
-    clr.push([12, midY - 3, 8, 6]);
-    clr.push([W - 20, midY - 3, 8, 6]);
+    clr.push([midX - 6, midY - 3, 12, 6], [12, midY - 3, 8, 6], [W - 20, midY - 3, 8, 6]);
     for (let p = N(400, wallDensity); p--;) {
       fillRect(grid, Math.floor(rng() * (W - 5)), Math.floor(rng() * (H - 5)), 3 + (rng() * 4 | 0), 3 + (rng() * 4 | 0), COST_BLOCK);
     }
@@ -699,8 +791,7 @@ export function generateMap(grid, seed, { preset = 'The Grand Citadel', wallDens
     const w3 = (W / 3) | 0;
     fillRect(grid, w3, 0, 3, H, COST_BLOCK);
     fillRect(grid, w3 * 2, 0, 3, H, COST_BLOCK);
-    clr.push([w3 - 1, (H * 0.45) | 0, 5, 8]);
-    clr.push([w3 * 2 - 1, (H * 0.55) | 0, 5, 8]);
+    clr.push([w3 - 1, (H * 0.45) | 0, 5, 8], [w3 * 2 - 1, (H * 0.55) | 0, 5, 8]);
     addHighways(2);
     addMud(N(1800, mudDensity), 4, 6);
   } else if (preset === 'Highway vs Swamp') {
@@ -721,10 +812,7 @@ export function generateMap(grid, seed, { preset = 'The Grand Citadel', wallDens
 }
 //#endregion
 
-//#region 10: SpatialHashAndAgentPool
-/**
- * Counting-sort 2D uniform spatial hash for fast O(1) neighbor queries and crowd separation.
- */
+//#region 11: SpatialHashAndAgentPool
 export class SpatialHash {
   constructor(w, h, cs, cap) {
     this.cs = cs;
@@ -753,17 +841,32 @@ export class SpatialHash {
 }
 
 /**
- * Structure-of-Arrays (SoA) memory pool storing kinematic and pathfinding state for all agents.
+ * Structure-of-Arrays (SoA) memory pool backed directly by `SharedArena` views when provided.
  */
 export class AgentPool {
-  constructor(cap) {
+  /**
+   * @param {number} cap - Maximum agent capacity.
+   * @param {SharedArena|null} [arena=null] - Shared memory arena backing the arrays.
+   */
+  constructor(cap, arena = null) {
     this.count = 0;
+    this.arena = arena;
     const f32 = () => new Float32Array(cap);
-    this.px = f32(); this.py = f32(); this.vx = f32(); this.vy = f32();
-    this.sepX = f32(); this.sepY = f32(); this.corrX = f32(); this.corrY = f32();
-    this.repathCd = f32();
-    this.state = new Uint8Array(cap); this.queued = new Uint8Array(cap); this.touching = new Uint8Array(cap);
-    this.pathIdx = new Int32Array(cap); this.goalCell = new Int32Array(cap).fill(-1);
+    this.px = arena ? arena.px : f32();
+    this.py = arena ? arena.py : f32();
+    this.vx = arena ? arena.vx : f32();
+    this.vy = arena ? arena.vy : f32();
+    this.sepX = arena ? arena.sepX : f32();
+    this.sepY = arena ? arena.sepY : f32();
+    this.corrX = arena ? arena.corrX : f32();
+    this.corrY = arena ? arena.corrY : f32();
+    this.repathCd = arena ? arena.repathCd : f32();
+    this.state = arena ? arena.state : new Uint8Array(cap);
+    this.queued = arena ? arena.queued : new Uint8Array(cap);
+    this.touching = arena ? arena.touching : new Uint8Array(cap);
+    this.pathIdx = arena ? arena.pathIdx : new Int32Array(cap);
+    this.goalCell = arena ? arena.goalCell : new Int32Array(cap);
+    this.goalCell.fill(-1);
     this.paths = Array.from({ length: cap }, () => null);
     this.fields = Array.from({ length: cap }, () => null);
   }
@@ -775,14 +878,17 @@ export class AgentPool {
 }
 //#endregion
 
-//#region 11: SimulationEngine
+//#region 12: SimulationEngine
 /**
  * Complete Hierarchical Flow Field Pathfinding & Crowd Physics Simulation Engine.
+ * Synchronizes all kinematic, field, and telemetry state into `SharedArena` via `Atomics`.
  */
 export class Simulation {
   constructor(opts = {}) {
-    this.agents = new AgentPool(MAX_AGENTS);
+    this.arena = opts.arena instanceof SharedArena ? opts.arena : new SharedArena(opts.buffer || null);
+    this.agents = new AgentPool(MAX_AGENTS, this.arena);
     this.agents.count = clamp(Math.round(opts.agentCount ?? 10_000), 0, MAX_AGENTS);
+    this.arena.store(CTRL.AGENT_COUNT, this.agents.count);
     this.agentRadius = opts.agentRadius ?? 0.25;
     this.spawnPattern = opts.spawnPattern ?? 'Left Flank';
     this.maxSpeed = opts.maxSpeed ?? 20.0;
@@ -794,6 +900,7 @@ export class Simulation {
     this.onGoal = opts.onGoal ?? null;
     this.onArrival = opts.onArrival ?? null;
     this.goal = null;
+    this.graphVersion = 0;
     this.frame = this.arrivedAtGoal = this.respawnCounter = this.accumulator = this.autoGoalTimer = this.arrivalTimer = 0;
     this.urgentQ = new RequestQueue(MAX_AGENTS * 2);
     this.bulkQ = new RequestQueue(MAX_AGENTS * 2);
@@ -804,28 +911,24 @@ export class Simulation {
 
   setAgentCount(cnt) {
     const prev = this.agents.count, next = this.agents.count = clamp(Math.round(cnt), 0, MAX_AGENTS);
+    this.arena.store(CTRL.AGENT_COUNT, next);
     for (let i = prev; i < next; i++) { this.spawnAgent(i); this.goal && this.reqPath(i, false); }
   }
 
   regenerate(seed, cx, cy, mapOpts = {}) {
     this.seed = seed;
     this.goal = null;
-    generateMap(this.grid = new GridWorld(cx, cy), seed, mapOpts);
+    generateMap(this.grid = new GridWorld(cx, cy, this.arena), seed, mapOpts);
     this.rebuildGraph();
     this.respawnAll();
     this.setGoal(this.grid.width * 0.9 | 0, this.grid.height * 0.5 | 0, false);
   }
 
-  /**
-   * Rebuilds the PortalGraph and MacroPathfinder. When `dirtyChunks` is provided,
-   * performs an incremental surgical update preserving cached fields and unmodified chunks.
-   * @param {Set<number>|null} [dirtyChunks=null] - Optional set of modified chunk IDs.
-   */
   rebuildGraph(dirtyChunks = null) {
-    const { grid } = this;
+    const { grid, arena } = this;
     const isIncremental = !!(dirtyChunks && this.graph && this.flowCache);
     this.graph = new PortalGraph(grid, isIncremental ? this.graph : null, dirtyChunks);
-    const pLen = this.graph.portals.length;
+    const pLen = Math.min(this.graph.portals.length, MAX_PORTALS);
     if (isIncremental) {
       this.flowCache.invalidateChunks(dirtyChunks);
       for (const c of dirtyChunks) {
@@ -836,32 +939,32 @@ export class Simulation {
       this.flowCache = new FlowFieldCache(grid);
       this.hash = new SpatialHash(grid.width, grid.height, Math.max(1.2, this.agentRadius * 3.2), MAX_AGENTS);
       this.activeFields = Array(grid.chunkCount).fill(null);
-      this.activeStamp = new Int32Array(grid.chunkCount).fill(-1);
+      this.activeStamp = arena.activeStamp.subarray(0, grid.chunkCount);
+      this.activeStamp.fill(-1);
     }
     this.pathfinder = new MacroPathfinder(grid, this.graph);
-    this.portalTargets = new Int32Array(pLen);
-    this.portalOnPath = new Uint8Array(pLen);
+    this.portalTargets = arena.portalTargets.subarray(0, pLen);
+    this.portalOnPath = arena.portalOnPath.subarray(0, pLen);
+    this.graphVersion++;
+    arena.store(CTRL.GRAPH_VERSION, this.graphVersion);
+    arena.raiseEvent(EVENTS.GRAPH_REBUILT);
     if (this.goal) {
       if (isIncremental) {
         const cell = grid.isWalkable(this.goal.x, this.goal.y)
           ? grid.index(this.goal.x, this.goal.y)
           : grid.findNearestWalkable(this.goal.x, this.goal.y, 24);
-        if (cell >= 0) this.goal = this.pathfinder.createGoal(cell);
+        if (cell >= 0) {
+          this.goal = this.pathfinder.createGoal(cell);
+          arena.store(CTRL.GOAL_X, this.goal.x);
+          arena.store(CTRL.GOAL_Y, this.goal.y);
+          arena.store(CTRL.GOAL_CHUNK, this.goal.chunk);
+        }
       } else {
         this.setGoal(this.goal.x, this.goal.y, false);
       }
     }
   }
 
-  /**
-   * Dynamically paints circular terrain of `cost` at `(wx, wy)` with radius `r`,
-   * surgically invalidating only affected chunks, portals, and agent corridors.
-   * @param {number} wx - World X center.
-   * @param {number} wy - World Y center.
-   * @param {number} r - Brush radius in cells.
-   * @param {number} cost - New cell traversal cost.
-   * @returns {number} Number of cells modified.
-   */
   paintTerrain(wx, wy, r, cost) {
     const { grid, agents: A } = this, { width: W, height: H, costs } = grid;
     const r2 = r * r;
@@ -943,13 +1046,19 @@ export class Simulation {
   }
 
   setGoal(cx, cy, playAudio = true) {
-    const { grid } = this, x = clamp(cx | 0, 0, grid.width - 1), y = clamp(cy | 0, 0, grid.height - 1);
+    const { grid, arena } = this, x = clamp(cx | 0, 0, grid.width - 1), y = clamp(cy | 0, 0, grid.height - 1);
     const cell = grid.isWalkable(x, y) ? grid.index(x, y) : grid.findNearestWalkable(x, y, 24);
     if (cell < 0) return false;
     this.goal = this.pathfinder.createGoal(cell);
+    arena.store(CTRL.GOAL_X, this.goal.x);
+    arena.store(CTRL.GOAL_Y, this.goal.y);
+    arena.store(CTRL.GOAL_CHUNK, this.goal.chunk);
     this.clearQ();
     this.autoGoalTimer = this.arrivalTimer = 0;
-    if (playAudio && this.onGoal) this.onGoal(this.goal);
+    if (playAudio) {
+      arena.raiseEvent(EVENTS.GOAL);
+      if (this.onGoal) this.onGoal(this.goal);
+    }
     for (let i = 0; i < this.agents.count; i++) this.reqPath(i, false);
     return true;
   }
@@ -1025,6 +1134,7 @@ export class Simulation {
 
   update(dt) {
     const t0 = performance.now();
+    this.arena.beginWrite();
     this.processRequests();
     this.accumulator += Math.min(dt * this.simSpeed, 0.2);
     for (let s = 0; this.accumulator >= FIXED_DT && s < 2; s++) {
@@ -1033,6 +1143,46 @@ export class Simulation {
     }
     if (this.accumulator >= FIXED_DT) this.accumulator = 0;
     this.lastSimDuration = performance.now() - t0;
+    this.syncSharedTelemetry();
+    this.arena.endWrite();
+  }
+
+  syncSharedTelemetry() {
+    const { arena, grid, agents: A } = this;
+    let actCnt = 0;
+    for (let c = 0; c < grid.chunkCount; c++) {
+      if (this.activeStamp[c] === this.frame && this.activeFields[c]) {
+        actCnt++;
+        const f = this.activeFields[c], off = c * CC;
+        arena.activeKind[c] = f.kind === 'g' ? 2 : 1;
+        arena.activeIntegration.set(f.integration, off);
+        arena.activeFlowX.set(f.flowX, off);
+        arena.activeFlowY.set(f.flowY, off);
+      }
+    }
+    const sel = arena.load(CTRL.SELECTED_ID);
+    const selPath = (sel >= 0 && sel < A.count) ? A.paths[sel] : null;
+    if (selPath && selPath.graph === this.graph) {
+      const cLen = Math.min(512, selPath.chunks.length), pLen = Math.min(512, selPath.portals.length);
+      arena.selPathChunks.set(selPath.chunks.subarray(0, cLen));
+      arena.selPathPortals.set(selPath.portals.subarray(0, pLen));
+      arena.selPathGoal[0] = selPath.goalX;
+      arena.selPathGoal[1] = selPath.goalY;
+      arena.store(CTRL.SEL_CHUNKS_LEN, cLen);
+      arena.store(CTRL.SEL_PORTALS_LEN, pLen);
+    } else {
+      arena.store(CTRL.SEL_CHUNKS_LEN, 0);
+      arena.store(CTRL.SEL_PORTALS_LEN, 0);
+    }
+
+    arena.store(CTRL.FRAME, this.frame);
+    arena.store(CTRL.AGENT_COUNT, A.count);
+    arena.store(CTRL.ARRIVED_COUNT, this.arrivedAtGoal);
+    arena.store(CTRL.ACTIVE_CHUNKS, actCnt);
+    arena.store(CTRL.FLOW_CACHE_COUNT, this.flowCache.entries.size);
+    arena.store(CTRL.SIM_DURATION_US, Math.round(this.lastSimDuration * 1000));
+    const remMs = this.autoGoal ? Math.max(0, (this.autoGoal.interval - this.autoGoalTimer) * 1000) : 0;
+    arena.store(CTRL.AUTOGOAL_REM_MS, Math.round(remMs));
   }
 
   step(h) {
@@ -1077,6 +1227,7 @@ export class Simulation {
     }
     this.portalTargets.fill(0); this.portalOnPath.fill(0);
     let arrCnt = 0;
+    const pCap = this.portalTargets.length;
     const crowdR = Math.sqrt((this.arrivedAtGoal * sepRad * sepRad * 0.866) / Math.PI) + 0.5;
     const contagR = Math.max(3, crowdR * 1.6), leaveR = crowdR * 2 + 4, vmax = this.maxSpeed * 1.25;
     for (let i = 0; i < n; i++) {
@@ -1104,8 +1255,11 @@ export class Simulation {
         }
         if (path && path.graph === this.graph) {
           const idx = A.pathIdx[i];
-          if (idx < path.portals.length) this.portalTargets[path.portals[idx]]++;
-          for (let k = idx; k < path.portals.length; k++) this.portalOnPath[path.portals[k]] = 1;
+          if (idx < path.portals.length && path.portals[idx] < pCap) this.portalTargets[path.portals[idx]]++;
+          for (let k = idx; k < path.portals.length; k++) {
+            const pid = path.portals[k];
+            if (pid < pCap) this.portalOnPath[pid] = 1;
+          }
         }
       }
       const gain = st === 1 ? this.steeringGain : this.steeringGain * 0.6;
@@ -1129,7 +1283,10 @@ export class Simulation {
       }
       if (st === 2 && this.goal && A.goalCell[i] === this.goal.cell) arrCnt++;
     }
-    if (this.arrivedAtGoal === 0 && arrCnt > 0 && this.onArrival) this.onArrival();
+    if (this.arrivedAtGoal === 0 && arrCnt > 0) {
+      this.arena.raiseEvent(EVENTS.ARRIVAL);
+      if (this.onArrival) this.onArrival();
+    }
     this.arrivedAtGoal = arrCnt;
     const ag = this.autoGoal;
     if (ag && ag.enabled && this.goal && n > 0) {
@@ -1199,12 +1356,357 @@ export class Simulation {
     A.px[i] = x; A.py[i] = y;
   }
 }
+//#endregion
+
+//#region 13: ComlinkWorkerHostAndSharedClient
+/**
+ * Comlink-exposed Worker Host that runs `Simulation` inside a Dedicated Web Worker
+ * and synchronizes state through `SharedArena` and `Atomics`.
+ */
+export class WorkerSimulationHost {
+  constructor() {
+    this.sim = null;
+    this.arena = null;
+    this.timerId = null;
+    this.lastTick = 0;
+  }
+
+  /**
+   * Initializes the worker simulation engine over the shared memory buffer.
+   * @param {SharedArrayBuffer|ArrayBuffer} buffer - Shared memory buffer.
+   * @param {Object} opts - Initial simulation and world options.
+   * @returns {Object} Initial portal graph snapshot.
+   */
+  init(buffer, opts) {
+    this.arena = new SharedArena(buffer);
+    this.sim = new Simulation({ ...opts, arena: this.arena });
+    this.sim.syncSharedTelemetry();
+    this.startLoop();
+    return {
+      isShared: this.arena.isShared,
+      graph: this.sim.graph.toSnapshot(),
+      fallbackBuffer: this.arena.isShared ? null : this.arena.buffer.slice(0)
+    };
+  }
+
+  startLoop() {
+    if (this.timerId) clearInterval(this.timerId);
+    this.lastTick = performance.now();
+    this.timerId = setInterval(() => {
+      const now = performance.now();
+      const dt = Math.min(0.1, (now - this.lastTick) / 1000);
+      this.lastTick = now;
+      if (!this.arena || !this.sim) return;
+      this.arena.add(CTRL.WORKER_TICKS, 1);
+      if (!this.arena.load(CTRL.PAUSED)) {
+        this.sim.update(dt);
+      }
+    }, 1000 / 60);
+  }
+
+  setGoal(x, y, playAudio = true) {
+    const ok = this.sim.setGoal(x, y, playAudio);
+    this.sim.syncSharedTelemetry();
+    return ok;
+  }
+
+  pickRandomGoal() {
+    const ok = this.sim.pickRandomGoal();
+    this.sim.syncSharedTelemetry();
+    return ok;
+  }
+
+  paintTerrain(wx, wy, r, cost) {
+    const changed = this.sim.paintTerrain(wx, wy, r, cost);
+    if (changed > 0) this.sim.syncSharedTelemetry();
+    return changed > 0 ? this.sim.graph.toSnapshot() : null;
+  }
+
+  regenerate(seed, cx, cy, mapOpts) {
+    this.sim.regenerate(seed, cx, cy, mapOpts);
+    this.sim.syncSharedTelemetry();
+    return this.sim.graph.toSnapshot();
+  }
+
+  setAgentCount(cnt) {
+    this.sim.setAgentCount(cnt);
+    this.sim.syncSharedTelemetry();
+  }
+
+  respawnAll() {
+    this.sim.respawnAll();
+    this.sim.syncSharedTelemetry();
+  }
+
+  updateParams(params) {
+    const { sim } = this;
+    if (!sim) return;
+    if (params.simSpeed !== undefined) sim.simSpeed = params.simSpeed;
+    if (params.spawnPattern !== undefined) sim.spawnPattern = params.spawnPattern;
+    if (params.agentRadius !== undefined) {
+      sim.agentRadius = params.agentRadius;
+      sim.hash = new SpatialHash(sim.grid.width, sim.grid.height, Math.max(1.2, sim.agentRadius * 3.2), MAX_AGENTS);
+    }
+    if (params.maxSpeed !== undefined) sim.maxSpeed = params.maxSpeed;
+    if (params.steeringGain !== undefined) sim.steeringGain = params.steeringGain;
+    if (params.separationStrength !== undefined) sim.separationStrength = params.separationStrength;
+    if (params.pathBudgetMs !== undefined) sim.pathBudgetMs = params.pathBudgetMs;
+    if (params.autoGoal !== undefined) Object.assign(sim.autoGoal, params.autoGoal);
+  }
+
+  getGraphSnapshot() {
+    return this.sim.graph.toSnapshot();
+  }
+
+  pullFallbackBuffer() {
+    return this.arena.buffer.slice(0);
+  }
+}
+
+/**
+ * Main-thread client facade that reads zero-copy `SharedArrayBuffer` state via `Atomics`
+ * and dispatches commands to `WorkerSimulationHost` via `Comlink`.
+ */
+export class SharedSimulationClient {
+  /**
+   * @param {SharedArena} arena - Shared memory arena.
+   * @param {Object} remote - Comlink-wrapped `WorkerSimulationHost` proxy.
+   * @param {Object} initGraph - Initial serialized portal graph.
+   * @param {Object} opts - Client callbacks and options.
+   */
+  constructor(arena, remote, initGraph, opts = {}) {
+    this.arena = arena;
+    this.remote = remote;
+    this.onGoal = opts.onGoal ?? null;
+    this.onArrival = opts.onArrival ?? null;
+    this.onGraphRebuilt = opts.onGraphRebuilt ?? null;
+    this.frame = 0;
+    this.arrivedAtGoal = 0;
+    this.lastSimDuration = 0;
+    this.autoGoalTimerRem = 0;
+    this.activeChunkCount = 0;
+    this.flowCacheSize = 0;
+    this.workerTicks = 0;
+    this.goal = null;
+    this.graph = initGraph;
+    this._syncingGraph = false;
+
+    const cx = opts.chunksX ?? 10, cy = opts.chunksY ?? 6;
+    this.grid = new GridWorld(cx, cy, arena);
+    this.activeStamp = arena.activeStamp;
+    this.portalTargets = arena.portalTargets;
+    this.portalOnPath = arena.portalOnPath;
+
+    this.activeFields = Array.from({ length: MAX_CHUNKS }, (_, c) => ({
+      chunkId: c,
+      kind: 'p',
+      originX: 0,
+      originY: 0,
+      integration: arena.activeIntegration.subarray(c * CC, (c + 1) * CC),
+      flowX: arena.activeFlowX.subarray(c * CC, (c + 1) * CC),
+      flowY: arena.activeFlowY.subarray(c * CC, (c + 1) * CC)
+    }));
+
+    this.selectedPathProxy = {
+      chunks: new Int32Array(0),
+      portals: new Int32Array(0),
+      goalX: 0,
+      goalY: 0,
+      graph: this.graph
+    };
+
+    const pathsProxy = new Proxy([], {
+      get: (_, prop) => {
+        const idx = Number(prop);
+        if (Number.isInteger(idx) && idx === this.arena.load(CTRL.SELECTED_ID)) {
+          return this.selectedPathProxy.chunks.length > 0 ? this.selectedPathProxy : null;
+        }
+        return null;
+      }
+    });
+
+    this.agents = {
+      count: opts.agentCount ?? 10_000,
+      px: arena.px,
+      py: arena.py,
+      vx: arena.vx,
+      vy: arena.vy,
+      state: arena.state,
+      pathIdx: arena.pathIdx,
+      goalCell: arena.goalCell,
+      paths: pathsProxy
+    };
+
+    this.flowCache = {
+      entries: {
+        get size() { return arena.load(CTRL.FLOW_CACHE_COUNT); }
+      }
+    };
+
+    this.refreshChunkOrigins();
+    this.syncFromShared();
+  }
+
+  refreshChunkOrigins() {
+    for (let c = 0; c < this.grid.chunkCount; c++) {
+      this.activeFields[c].originX = this.grid.chunkOriginX(c);
+      this.activeFields[c].originY = this.grid.chunkOriginY(c);
+    }
+  }
+
+  /**
+   * Reads consistent frame telemetry and events from `SharedArena` using `Atomics`.
+   */
+  syncFromShared() {
+    const { arena } = this;
+    if (!arena.isShared && !this._pullingFallback) {
+      this._pullingFallback = true;
+      this.remote.pullFallbackBuffer().then(buf => {
+        new Uint8Array(arena.buffer).set(new Uint8Array(buf));
+        this._pullingFallback = false;
+      });
+    }
+
+    arena.readConsistent(() => {
+      const cx = arena.load(CTRL.CHUNKS_X), cy = arena.load(CTRL.CHUNKS_Y);
+      if (cx > 0 && cy > 0 && (cx !== this.grid.cx || cy !== this.grid.cy)) {
+        this.grid.cx = cx; this.grid.cy = cy;
+        this.grid.width = cx * CS; this.grid.height = cy * CS;
+        this.grid.chunkCount = cx * cy;
+        this.grid.costs = arena.gridCosts.subarray(0, this.grid.width * this.grid.height);
+        this.refreshChunkOrigins();
+      }
+      this.grid.version = arena.load(CTRL.GRID_VERSION);
+      this.frame = arena.load(CTRL.FRAME);
+      this.agents.count = arena.load(CTRL.AGENT_COUNT);
+      this.arrivedAtGoal = arena.load(CTRL.ARRIVED_COUNT);
+      this.activeChunkCount = arena.load(CTRL.ACTIVE_CHUNKS);
+      this.flowCacheSize = arena.load(CTRL.FLOW_CACHE_COUNT);
+      this.lastSimDuration = arena.load(CTRL.SIM_DURATION_US) / 1000;
+      this.autoGoalTimerRem = arena.load(CTRL.AUTOGOAL_REM_MS) / 1000;
+      this.workerTicks = arena.load(CTRL.WORKER_TICKS);
+
+      const gx = arena.load(CTRL.GOAL_X), gy = arena.load(CTRL.GOAL_Y), gc = arena.load(CTRL.GOAL_CHUNK);
+      this.goal = gx >= 0 ? { x: gx, y: gy, chunk: gc } : null;
+
+      for (let c = 0; c < this.grid.chunkCount; c++) {
+        if (this.activeStamp[c] === this.frame) {
+          this.activeFields[c].kind = arena.activeKind[c] === 2 ? 'g' : 'p';
+        }
+      }
+
+      const cLen = arena.load(CTRL.SEL_CHUNKS_LEN), pLen = arena.load(CTRL.SEL_PORTALS_LEN);
+      this.selectedPathProxy.chunks = arena.selPathChunks.subarray(0, cLen);
+      this.selectedPathProxy.portals = arena.selPathPortals.subarray(0, pLen);
+      this.selectedPathProxy.goalX = arena.selPathGoal[0];
+      this.selectedPathProxy.goalY = arena.selPathGoal[1];
+      this.selectedPathProxy.graph = this.graph;
+    });
+
+    const ev = arena.consumeEvents();
+    if ((ev & EVENTS.GOAL) && this.onGoal) this.onGoal(this.goal);
+    if ((ev & EVENTS.ARRIVAL) && this.onArrival) this.onArrival();
+    if ((ev & EVENTS.GRAPH_REBUILT) && !this._syncingGraph) {
+      this._syncingGraph = true;
+      this.remote.getGraphSnapshot().then(g => {
+        this.graph = g;
+        this.selectedPathProxy.graph = g;
+        this._syncingGraph = false;
+        if (this.onGraphRebuilt) this.onGraphRebuilt(g);
+      });
+    }
+  }
+
+  setPaused(paused) { this.arena.store(CTRL.PAUSED, paused ? 1 : 0); }
+  setSelectedId(id) { this.arena.store(CTRL.SELECTED_ID, id | 0); }
+  setGoal(x, y, playAudio = true) { return this.remote.setGoal(x, y, playAudio); }
+  pickRandomGoal() { return this.remote.pickRandomGoal(); }
+  setAgentCount(cnt) {
+    this.agents.count = clamp(Math.round(cnt), 0, MAX_AGENTS);
+    this.arena.store(CTRL.AGENT_COUNT, this.agents.count);
+    return this.remote.setAgentCount(cnt);
+  }
+  respawnAll() { return this.remote.respawnAll(); }
+  updateParams(params) { return this.remote.updateParams(params); }
+
+  async paintTerrain(wx, wy, r, cost) {
+    const newGraph = await this.remote.paintTerrain(wx, wy, r, cost);
+    if (newGraph) {
+      this.graph = newGraph;
+      this.selectedPathProxy.graph = newGraph;
+    }
+  }
+
+  async regenerate(seed, cx, cy, mapOpts) {
+    const newGraph = await this.remote.regenerate(seed, cx, cy, mapOpts);
+    this.graph = newGraph;
+    this.selectedPathProxy.graph = newGraph;
+    this.syncFromShared();
+  }
+
+  findAgentNear(wx, wy, maxRadius = 1.6) {
+    const A = this.agents, n = A.count;
+    let best = -1, bestD2 = maxRadius * maxRadius;
+    for (let i = 0; i < n; i++) {
+      const dx = A.px[i] - wx, dy = A.py[i] - wy, d2 = dx * dx + dy * dy;
+      if (d2 < bestD2) { bestD2 = d2; best = i; }
+    }
+    return best;
+  }
+}
+
+/**
+ * Spawns a Dedicated Module Web Worker, binds it with `Comlink`, initializes `SharedArena`
+ * (`SharedArrayBuffer` + `Atomics`), and returns the connected `SharedSimulationClient`.
+ * @param {Object} Comlink - Imported Comlink module.
+ * @param {Object} opts - Initial world and simulation configuration.
+ * @param {string} [comlinkEsmUrl] - CDN URL for Comlink inside the worker.
+ * @returns {Promise<SharedSimulationClient>} Connected shared-memory simulation client.
+ */
+export async function createComlinkSimulation(
+  Comlink,
+  opts = {},
+  comlinkEsmUrl = 'https://cdn.jsdelivr.net/npm/comlink@4.4.2/dist/esm/comlink.min.mjs'
+) {
+  const arena = new SharedArena();
+  const apiUrl = new URL(import.meta.url).href;
+  const workerSrc = `
+    import * as Comlink from ${JSON.stringify(comlinkEsmUrl)};
+    import { WorkerSimulationHost } from ${JSON.stringify(apiUrl)};
+    Comlink.expose(new WorkerSimulationHost());
+  `;
+  const blob = new Blob([workerSrc], { type: 'text/javascript' });
+  const worker = new Worker(URL.createObjectURL(blob), { type: 'module', name: 'HFFP-Comlink-Worker' });
+  const remote = Comlink.wrap(worker);
+
+  const serializableOpts = {
+    seed: opts.seed,
+    chunksX: opts.chunksX,
+    chunksY: opts.chunksY,
+    preset: opts.preset,
+    wallDensity: opts.wallDensity,
+    mudDensity: opts.mudDensity,
+    agentCount: opts.agentCount,
+    agentRadius: opts.agentRadius,
+    spawnPattern: opts.spawnPattern,
+    maxSpeed: opts.maxSpeed,
+    steeringGain: opts.steeringGain,
+    separationStrength: opts.separationStrength,
+    pathBudgetMs: opts.pathBudgetMs,
+    simSpeed: opts.simSpeed,
+    autoGoal: opts.autoGoal ? { ...opts.autoGoal } : null
+  };
+
+  const initRes = await remote.init(arena.buffer, serializableOpts);
+  if (!initRes.isShared && initRes.fallbackBuffer) {
+    new Uint8Array(arena.buffer).set(new Uint8Array(initRes.fallbackBuffer));
+  }
+  return new SharedSimulationClient(arena, remote, initRes.graph, opts);
+}
 
 /**
  * Executes a deterministic headless performance benchmark across presets.
  * @param {Object} [opts] - Benchmark options.
- * @param {number} [opts.agentCount=10000] - Number of simulated agents.
- * @param {number} [opts.steps=30] - Number of fixed physics steps per preset.
  * @returns {Array<Object>} Benchmark results table.
  */
 export function runBenchmark({ agentCount = 10_000, steps = 30 } = {}) {
@@ -1225,6 +1727,7 @@ export function runBenchmark({ agentCount = 10_000, steps = 30 } = {}) {
 
     results.push({
       Preset: preset,
+      SAB: sim.arena.isShared ? 'SharedArrayBuffer' : 'ArrayBuffer',
       Portals: sim.graph.portals.length,
       'Init Build (ms)': +buildMs.toFixed(2),
       'Surgical Edit (ms)': +incrementalEditMs.toFixed(2),

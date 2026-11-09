@@ -1,7 +1,7 @@
 // test.js
 import {
   CS, MAX_AGENTS, COST_HIGHWAY, COST_OPEN, COST_MUD, COST_BLOCK,
-  clamp, SpatialHash, Simulation, runBenchmark
+  clamp, createComlinkSimulation, runBenchmark
 } from './flowFieldApi.js';
 
 const createOffscreen = (w, h) => Object.assign(
@@ -10,12 +10,26 @@ const createOffscreen = (w, h) => Object.assign(
 );
 
 (async () => {
-  //#region 1: BootstrapAndDOMInjection
-  const { PIXI, GUI, UPlotClass, canvas, minimapCard, minimapCanvas } = await (async () => {
-    document.title = 'Hierarchical Flow Field Pathfinding';
+//#region 1: BootstrapAndDOMInjection
+  const { PIXI, GUI, UPlotClass, Comlink, canvas, minimapCard, minimapCanvas } = await (async () => {
+    if (!window.crossOriginIsolated && window.isSecureContext && 'serviceWorker' in navigator) {
+      const hasCoiScript = !!document.querySelector('script[src*="coi-serviceworker"]');
+      if (!hasCoiScript) {
+        await new Promise(resolve => {
+          const coiScript = document.createElement('script');
+          coiScript.src = new URL('./coi-serviceworker.min.js', import.meta.url).href;
+          coiScript.onload = resolve;
+          coiScript.onerror = resolve;
+          document.head.appendChild(coiScript);
+        });
+      }
+    }
+
+    document.title = 'Hierarchical Flow Field Pathfinding (SAB + Atomics + Comlink)';
 
     const link = document.createElement('link');
     link.rel = 'stylesheet';
+    link.crossOrigin = 'anonymous';
     link.href = 'https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css';
     document.head.appendChild(link);
 
@@ -75,17 +89,18 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
 
     document.body.append(minimapCard, canvas);
 
-    const [PIXI, guiMod, uplotMod] = await Promise.all([
+    const [PIXI, guiMod, uplotMod, Comlink] = await Promise.all([
       import('https://cdn.jsdelivr.net/npm/pixi.js@8.22.0/dist/pixi.min.mjs'),
       import('https://cdn.jsdelivr.net/npm/lil-gui@0.21.0/dist/lil-gui.esm.min.js'),
-      import('https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.esm.js')
+      import('https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.esm.js'),
+      import('https://cdn.jsdelivr.net/npm/comlink@4.4.2/dist/esm/comlink.min.mjs')
     ]);
 
     const GUI = guiMod.default || guiMod;
     const uPlot = uplotMod.default || uplotMod;
     const UPlotClass = uPlot?.default || uPlot;
 
-    return { PIXI, GUI, UPlotClass, canvas, minimapCard, minimapCanvas };
+    return { PIXI, GUI, UPlotClass, Comlink, canvas, minimapCard, minimapCanvas };
   })();
   //#endregion
 
@@ -133,6 +148,8 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
       enabled: true
     },
     telemetry: {
+      ipcMode: 'Initializing...',
+      workerTicks: 0,
       fps: 60,
       simMs: 0.0,
       activeChunks: 0,
@@ -152,7 +169,7 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
   //#endregion
 
   //#region 3: SoundSynthesizer
-  const { SoundEngine, audio } = (() => {
+  const { audio } = (() => {
     class SoundEngine {
       constructor() { this.ctx = null; }
       init() {
@@ -205,52 +222,40 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
         osc.start(now); osc.stop(now + 0.04);
       }
     }
-    const audio = new SoundEngine();
-    return { SoundEngine, audio };
+    return { audio: new SoundEngine() };
   })();
   //#endregion
 
   //#region 4: SparklineGUIExtension
   (() => {
     GUI.prototype.addSparkline = function(title, options = {}) {
-      const height = options.height || 48;
-      const maxPoints = options.points || 40;
-      const color = options.color || '#38bdf8';
-      const fill = options.fill || 'rgba(56, 189, 248, 0.15)';
-      const unit = options.unit || '';
+      const height = options.height || 48, maxPoints = options.points || 40;
+      const color = options.color || '#38bdf8', fill = options.fill || 'rgba(56, 189, 248, 0.15)', unit = options.unit || '';
 
       const row = document.createElement('div');
       row.className = 'lil-sparkline-row';
-      row.style.cssText = `
-        padding: 6px 8px; border-bottom: 1px solid rgba(255, 255, 255, 0.07);
-        display: flex; flex-direction: column; gap: 4px;
-        background: rgba(15, 23, 42, 0.45); box-sizing: border-box; width: 100%;
-      `;
+      row.style.cssText = 'padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.07);display:flex;flex-direction:column;gap:4px;background:rgba(15,23,42,0.45);box-sizing:border-box;width:100%;';
 
       const header = document.createElement('div');
-      header.style.cssText = `display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: #94a3b8;`;
+      header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;font-size:11px;color:#94a3b8;';
 
       const labelSpan = document.createElement('span');
       labelSpan.textContent = title;
       labelSpan.style.fontWeight = '600';
 
       const valueSpan = document.createElement('span');
-      valueSpan.style.cssText = `color: ${color}; font-weight: bold; font-family: monospace; font-size: 11px;`;
+      valueSpan.style.cssText = `color:${color};font-weight:bold;font-family:monospace;font-size:11px;`;
       valueSpan.textContent = `-- ${unit}`;
 
       header.append(labelSpan, valueSpan);
       row.appendChild(header);
 
       const plotContainer = document.createElement('div');
-      plotContainer.style.cssText = `
-        width: 100%; height: ${height}px; overflow: hidden; position: relative;
-        border-radius: 4px; border: 1px solid rgba(56, 189, 248, 0.15); background: rgba(4, 8, 18, 0.7);
-      `;
+      plotContainer.style.cssText = `width:100%;height:${height}px;overflow:hidden;position:relative;border-radius:4px;border:1px solid rgba(56,189,248,0.15);background:rgba(4,8,18,0.7);`;
       row.appendChild(plotContainer);
       (this.$children || this.domElement).appendChild(row);
 
-      const xData = new Float64Array(maxPoints);
-      const yData = new Float64Array(maxPoints).fill(0);
+      const xData = new Float64Array(maxPoints), yData = new Float64Array(maxPoints).fill(0);
       for (let i = 0; i < maxPoints; i++) xData[i] = i;
 
       const uOpts = {
@@ -259,11 +264,10 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
         scales: {
           x: { time: false },
           y: {
-            range: (u, min, max) => {
-              const lo = options.min !== undefined ? options.min : Math.floor(Math.min(min, 0));
-              const hi = options.max !== undefined ? options.max : Math.ceil(Math.max(max * 1.15, 1));
-              return [lo, hi];
-            }
+            range: (u, min, max) => [
+              options.min !== undefined ? options.min : Math.floor(Math.min(min, 0)),
+              options.max !== undefined ? options.max : Math.ceil(Math.max(max * 1.15, 1))
+            ]
           }
         },
         axes: [
@@ -309,7 +313,7 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
   //#endregion
 
   //#region 5: ThemeAndColorLUTs
-  const { THEME_RAW, THEME, HEATMAP_LUT, TINTS } = (() => {
+  const { THEME, HEATMAP_LUT, TINTS } = (() => {
     const THEME_RAW = {
       bg: '#040711', gA: '#090f1d', gB: '#0d1527',
       wall: '#1e293b', wallTop: '#334155',
@@ -332,7 +336,7 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
       return { num: c.toNumber(), r: (r * 255) | 0, g: (g * 255) | 0, b: (b * 255) | 0 };
     });
     const TINTS = [0x94a3b8, 0x22d3ee, 0x4ade80, 0xf87171];
-    return { THEME_RAW, THEME, HEATMAP_LUT, TINTS };
+    return { THEME, HEATMAP_LUT, TINTS };
   })();
   //#endregion
 
@@ -340,22 +344,15 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
   const { VisualPlugin, VisualPluginManager } = (() => {
     class VisualPlugin {
       constructor(id, name, defaultEnabled = false, phase = 'beforeAgents') {
-        this.id = id;
-        this.name = name;
-        this.phase = phase;
-        this._enabled = defaultEnabled;
+        this.id = id; this.name = name; this.phase = phase; this._enabled = defaultEnabled;
       }
       get enabled() { return this._enabled; }
       set enabled(val) {
         const b = !!val;
         if (this._enabled === b) return;
         this._enabled = b;
-        if (b) this.onEnable?.();
-        else this.onDisable?.();
+        b ? this.onEnable?.() : this.onDisable?.();
       }
-      enable() { this.enabled = true; }
-      disable() { this.enabled = false; }
-      toggle() { this.enabled = !this.enabled; }
       init(context) {}
       render(context) {}
       onEnable() {}
@@ -373,7 +370,6 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
         plugin.init?.({ renderer: this.renderer, world: this.renderer.world, app: this.renderer.app });
         return plugin;
       }
-      get(id) { return this.plugins.get(id); }
       renderPhase(phase, ctx) {
         for (const plugin of this.plugins.values()) {
           if (plugin.enabled && plugin.phase === phase) plugin.render(ctx);
@@ -407,9 +403,7 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
       init({ world }) {
         this.container = new PIXI.Container();
         this.container.zIndex = 40;
-        this.bgG = new PIXI.Graphics();
-        this.pG = new PIXI.Graphics();
-        this.gG = new PIXI.Graphics();
+        this.bgG = new PIXI.Graphics(); this.pG = new PIXI.Graphics(); this.gG = new PIXI.Graphics();
         this.container.addChild(this.bgG, this.pG, this.gG);
         this.container.visible = false;
         world.addChild(this.container);
@@ -579,7 +573,7 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
           const p = portals[u];
           for (let e = edgeOffsets[u]; e < edgeOffsets[u + 1]; e++) {
             const v = edgeTargets[e];
-            if (v > u) { g.moveTo(p.anchorX, p.anchorY).lineTo(portals[v].anchorX, portals[v].anchorY); cnt++; }
+            if (v > u && portals[v]) { g.moveTo(p.anchorX, p.anchorY).lineTo(portals[v].anchorX, portals[v].anchorY); cnt++; }
           }
         }
         if (cnt > 0) {
@@ -631,18 +625,23 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
       }
       render({ sim, renderer, primarySel }) {
         const g = this.graphics, A = sim.agents, cp = renderer.cellPx;
-        if (primarySel < 0 || primarySel >= A.count || !A.paths[primarySel] || A.paths[primarySel].graph !== sim.graph) {
+        const path = (primarySel >= 0 && primarySel < A.count) ? A.paths[primarySel] : null;
+        if (!path || !path.chunks.length || path.graph !== sim.graph) {
           g.clear(); g.visible = false; return;
         }
         g.clear(); g.visible = true;
-        const path = A.paths[primarySel], idx = Math.min(A.pathIdx[primarySel], path.chunks.length - 1), { grid, graph } = sim;
+        const idx = clamp(A.pathIdx[primarySel], 0, path.chunks.length - 1), { grid, graph } = sim;
         for (let k = idx; k < path.chunks.length; k++) {
           const c = path.chunks[k];
           g.rect(grid.chunkOriginX(c) + 0.1, grid.chunkOriginY(c) + 0.1, CS - 0.2, CS - 0.2)
            .stroke({ color: THEME.corridor.num, width: 2 / cp, alpha: THEME.corridor.alpha });
         }
         g.moveTo(A.px[primarySel], A.py[primarySel]);
-        const pts = path.portals.slice(idx).map(p => graph.portals[p]);
+        const pts = [];
+        for (let k = idx; k < path.portals.length; k++) {
+          const p = graph.portals[path.portals[k]];
+          if (p) pts.push(p);
+        }
         for (let i = 0; i < pts.length; i++) g.lineTo(pts[i].anchorX, pts[i].anchorY);
         g.lineTo(path.goalX, path.goalY).stroke({ color: THEME.aPath.num, width: 2.5 / cp, cap: 'round', join: 'round' });
         for (let i = 0; i < pts.length; i++) g.circle(pts[i].anchorX, pts[i].anchorY, Math.max(3, cp * 0.35) / cp);
@@ -668,7 +667,7 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
         const g = this.graphics, cp = renderer.cellPx;
         if (cp < 7) { g.clear(); g.visible = false; return; }
         g.clear();
-        const A = sim.agents, n = A.count;
+        const A = sim.agents, n = A.count, rad = CONFIG.simulation.agentRadius;
         const cMinX = renderer.camera.x - (renderer.cssWidth / 2) / cp - 2;
         const cMaxX = renderer.camera.x + (renderer.cssWidth / 2) / cp + 2;
         const cMinY = renderer.camera.y - (renderer.cssHeight / 2) / cp - 2;
@@ -680,7 +679,7 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
           if (x < cMinX || x > cMaxX || y < cMinY || y > cMaxY) continue;
           const spd = Math.hypot(A.vx[i], A.vy[i]);
           if (spd > 0.3) {
-            const s = sim.agentRadius * 1.8 / spd;
+            const s = rad * 1.8 / spd;
             g.moveTo(x, y).lineTo(x + A.vx[i] * s, y + A.vy[i] * s);
             if (++tCnt >= 3000) break;
           }
@@ -757,7 +756,6 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
         this.boxSelectG = G(); this.boxSelectG.zIndex = 100;
         this.goalG = G(); this.goalG.zIndex = 110;
         this.hoverG = G(); this.hoverG.zIndex = 120;
-
         this.world.addChild(this.selectionG, this.boxSelectG, this.goalG, this.hoverG);
 
         const c = createOffscreen(32, 32), ctx = c.getContext('2d');
@@ -1000,32 +998,39 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
   //#region 10: TelemetryAndControlsGUI
   const setupGUIAndHelpers = (() => {
     return (sim, renderer) => {
+      function selectAgent(id) {
+        CONFIG.telemetry.selectedId = id;
+        sim.setSelectedId(id);
+      }
+
       function setAgentCount(count) {
         CONFIG.simulation.agentCount = count;
         CONFIG.telemetry.agentCount = count;
         sim.setAgentCount(count);
-        if (CONFIG.telemetry.selectedId >= sim.agents.count) CONFIG.telemetry.selectedId = 0;
+        if (CONFIG.telemetry.selectedId >= count) selectAgent(0);
         audio.playClick();
       }
 
-      function rebuildWorld() {
+      async function rebuildWorld() {
         CONFIG.world.chunksX = clamp(Math.round(CONFIG.world.chunksX), 3, 24);
         CONFIG.world.chunksY = clamp(Math.round(CONFIG.world.chunksY), 3, 18);
-        sim.regenerate(CONFIG.world.seed, CONFIG.world.chunksX, CONFIG.world.chunksY, CONFIG.world);
+        await sim.regenerate(CONFIG.world.seed, CONFIG.world.chunksX, CONFIG.world.chunksY, { ...CONFIG.world });
         renderer.onWorldResized(sim.grid);
-        if (CONFIG.telemetry.selectedId >= sim.agents.count) CONFIG.telemetry.selectedId = 0;
+        if (CONFIG.telemetry.selectedId >= sim.agents.count) selectAgent(0);
         renderer.selectedAgents.clear();
         renderer.selectedAgents.add(CONFIG.telemetry.selectedId);
       }
 
-      const findAgentNear = (wx, wy, maxRadius = 1.6) => sim.findAgentNear(wx, wy, maxRadius);
+      const syncAutoGoal = () => sim.updateParams({ autoGoal: { ...CONFIG.autoGoal } });
 
       const metricsGui = new GUI({ title: 'Metrics & Telemetry', width: 315 });
       metricsGui.domElement.style.cssText = 'position:fixed;left:12px;right:auto;top:12px;z-index:1000;max-height:calc(100vh - 24px);overflow-y:auto;';
 
-      const fPerf = metricsGui.addFolder('Real-time Diagnostics');
-      const sparkFps = fPerf.addSparkline('Framerate', { color: '#38bdf8', unit: 'FPS', min: 0, max: 75, height: 46 });
-      const sparkSim = fPerf.addSparkline('Simulation Step', { color: '#a78bfa', unit: 'ms', min: 0, max: 16, height: 46 });
+      const fPerf = metricsGui.addFolder('Real-time Diagnostics (Comlink + SAB)');
+      const sparkFps = fPerf.addSparkline('Render Framerate', { color: '#38bdf8', unit: 'FPS', min: 0, max: 75, height: 46 });
+      const sparkSim = fPerf.addSparkline('Worker Step Time', { color: '#a78bfa', unit: 'ms', min: 0, max: 16, height: 46 });
+      fPerf.add(CONFIG.telemetry, 'ipcMode').name('Memory / IPC').listen().disable();
+      fPerf.add(CONFIG.telemetry, 'workerTicks').name('Atomic Heartbeat').listen().disable();
       fPerf.add(CONFIG.telemetry, 'lastBenchmark').name('Benchmark').listen().disable();
       fPerf.add({
         bench: () => {
@@ -1058,19 +1063,19 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
       fInspect.add(CONFIG.telemetry, 'selectedState').name('Agent State').listen().disable();
       fInspect.add(CONFIG.telemetry, 'selectedSpeed').name('Speed (u/s)').listen().disable();
       fInspect.add(CONFIG.telemetry, 'selectedGoalDist').name('Dist to Goal').listen().disable();
-      fInspect.add(CONFIG.telemetry, 'selectedCorridor').name('Corridor Corridor').listen().disable();
+      fInspect.add(CONFIG.telemetry, 'selectedCorridor').name('Corridor').listen().disable();
 
       fInspect.add({
         selectNext: () => {
           if (!sim.agents.count) return;
-          CONFIG.telemetry.selectedId = (CONFIG.telemetry.selectedId + 1) % sim.agents.count;
+          selectAgent((CONFIG.telemetry.selectedId + 1) % sim.agents.count);
           renderer.selectedAgents.clear(); renderer.selectedAgents.add(CONFIG.telemetry.selectedId);
         }
       }, 'selectNext').name('Inspect Next');
       fInspect.add({
         selectRandom: () => {
           if (!sim.agents.count) return;
-          CONFIG.telemetry.selectedId = Math.floor(Math.random() * sim.agents.count);
+          selectAgent(Math.floor(Math.random() * sim.agents.count));
           renderer.selectedAgents.clear(); renderer.selectedAgents.add(CONFIG.telemetry.selectedId);
         }
       }, 'selectRandom').name('Inspect Random');
@@ -1083,7 +1088,7 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
       fInspect.add({ clearSelect: () => renderer.selectedAgents.clear() }, 'clearSelect').name('Clear Selection');
 
       const fActions = metricsGui.addFolder('Tactical Operations');
-      fActions.add(CONFIG.simulation, 'paused').name('Pause Simulation');
+      fActions.add(CONFIG.simulation, 'paused').name('Pause Simulation').onChange(v => sim.setPaused(v));
       fActions.add(renderer, 'followSelected').name('Follow Selected Cam').listen();
       fActions.add({ resetCam: () => renderer.resetCamera(sim.grid) }, 'resetCam').name('Reset Camera View');
       fActions.add(CONFIG.audio, 'enabled').name('Sound FX Enabled');
@@ -1106,39 +1111,39 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
       fW.add({ rebuildWorld }, 'rebuildWorld').name('Rebuild World');
 
       const fS = controlsGui.addFolder('Swarm & Physics');
-      fS.add(CONFIG.simulation, 'simSpeed', 0.1, 10.0, 0.1).name('Speed Multiplier').onChange(v => { sim.simSpeed = v; });
+      fS.add(CONFIG.simulation, 'simSpeed', 0.1, 10.0, 0.1).name('Speed Multiplier').onChange(simSpeed => sim.updateParams({ simSpeed }));
       fS.add(CONFIG.simulation, 'agentCount', 100, MAX_AGENTS, 100).name('Total Agents').listen().onChange(setAgentCount);
-      fS.add(CONFIG.simulation, 'spawnPattern', ['Left Flank', 'Scatter Everywhere', 'Four Corners', 'Center Cluster']).name('Spawn Layout').onChange(v => {
-        sim.spawnPattern = v; sim.respawnAll();
+      fS.add(CONFIG.simulation, 'spawnPattern', ['Left Flank', 'Scatter Everywhere', 'Four Corners', 'Center Cluster']).name('Spawn Layout').onChange(spawnPattern => {
+        sim.updateParams({ spawnPattern });
+        sim.respawnAll();
       });
-      fS.add(CONFIG.simulation, 'agentRadius', 0.15, 0.55, 0.05).name('Agent Radius').onChange(r => {
-        sim.agentRadius = r;
-        sim.hash = new SpatialHash(sim.grid.width, sim.grid.height, Math.max(1.2, r * 3.2), MAX_AGENTS);
-        renderer.updateAgentBaseScale(r);
+      fS.add(CONFIG.simulation, 'agentRadius', 0.15, 0.55, 0.05).name('Agent Radius').onChange(agentRadius => {
+        sim.updateParams({ agentRadius });
+        renderer.updateAgentBaseScale(agentRadius);
       });
-      fS.add(CONFIG.simulation, 'maxSpeed', 1, 50, 0.5).name('Max Speed').onChange(v => { sim.maxSpeed = v; });
-      fS.add(CONFIG.simulation, 'steeringGain', 2, 50, 0.5).name('Steering Gain').onChange(v => { sim.steeringGain = v; });
-      fS.add(CONFIG.simulation, 'separationStrength', 0, 60, 1).name('Repulsion Force').onChange(v => { sim.separationStrength = v; });
-      fS.add(CONFIG.simulation, 'pathBudgetMs', 0.5, 50, 0.5).name('Path Budget (ms)').onChange(v => { sim.pathBudgetMs = v; });
+      fS.add(CONFIG.simulation, 'maxSpeed', 1, 50, 0.5).name('Max Speed').onChange(maxSpeed => sim.updateParams({ maxSpeed }));
+      fS.add(CONFIG.simulation, 'steeringGain', 2, 50, 0.5).name('Steering Gain').onChange(steeringGain => sim.updateParams({ steeringGain }));
+      fS.add(CONFIG.simulation, 'separationStrength', 0, 60, 1).name('Repulsion Force').onChange(separationStrength => sim.updateParams({ separationStrength }));
+      fS.add(CONFIG.simulation, 'pathBudgetMs', 0.5, 50, 0.5).name('Path Budget (ms)').onChange(pathBudgetMs => sim.updateParams({ pathBudgetMs }));
 
       const fG = controlsGui.addFolder('Auto Goal Routing');
-      fG.add(CONFIG.autoGoal, 'enabled').name('Enable Auto Goals');
-      fG.add(CONFIG.autoGoal, 'mode', ['Either', 'On Arrival', 'Timer']).name('Trigger Mode');
-      fG.add(CONFIG.autoGoal, 'arrivalPct', 0.1, 1.0, 0.05).name('Arrival Target (Ratio)');
-      fG.add(CONFIG.autoGoal, 'delay', 0.2, 5.0, 0.1).name('Post-Arrival Pause (s)');
-      fG.add(CONFIG.autoGoal, 'interval', 3, 30, 1).name('Max Interval (s)');
+      fG.add(CONFIG.autoGoal, 'enabled').name('Enable Auto Goals').onChange(syncAutoGoal);
+      fG.add(CONFIG.autoGoal, 'mode', ['Either', 'On Arrival', 'Timer']).name('Trigger Mode').onChange(syncAutoGoal);
+      fG.add(CONFIG.autoGoal, 'arrivalPct', 0.1, 1.0, 0.05).name('Arrival Target (Ratio)').onChange(syncAutoGoal);
+      fG.add(CONFIG.autoGoal, 'delay', 0.2, 5.0, 0.1).name('Post-Arrival Pause (s)').onChange(syncAutoGoal);
+      fG.add(CONFIG.autoGoal, 'interval', 3, 30, 1).name('Max Interval (s)').onChange(syncAutoGoal);
 
       const fPlugins = controlsGui.addFolder('Visual Plugins');
       renderer.pluginManager.attachGUI(fPlugins);
 
-      return { sparkFps, sparkSim, findAgentNear };
+      return { sparkFps, sparkSim, selectAgent, findAgentNear: (wx, wy, r) => sim.findAgentNear(wx, wy, r) };
     };
   })();
   //#endregion
 
   //#region 11: PointerAndViewportInteraction
   const attachInteraction = (() => {
-    return ({ canvas, minimapCanvas: mCanvas, sim, renderer, hover, findAgentNear }) => {
+    return ({ canvas, minimapCanvas: mCanvas, sim, renderer, hover, findAgentNear, selectAgent }) => {
       let isDown = false, isBoxSelecting = false, isPainting = false, dragged = false, isPanning = false;
       let startX = 0, startY = 0, lastX = 0, lastY = 0, boxStart = { x: 0, y: 0 };
 
@@ -1254,7 +1259,7 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
               }
             }
             if (renderer.selectedAgents.size > 0) {
-              CONFIG.telemetry.selectedId = renderer.selectedAgents.values().next().value;
+              selectAgent(renderer.selectedAgents.values().next().value);
             }
           }
           return;
@@ -1263,7 +1268,7 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
         if (isDown && !dragged) {
           const clickedAgent = findAgentNear(hover.x, hover.y, 1.4);
           if (clickedAgent >= 0) {
-            CONFIG.telemetry.selectedId = clickedAgent;
+            selectAgent(clickedAgent);
             renderer.selectedAgents.clear();
             renderer.selectedAgents.add(clickedAgent);
           } else {
@@ -1306,13 +1311,15 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
     await app.init({ canvas, resizeTo: window, autoDensity: true, antialias: false, backgroundColor: 0x040711 });
     app.ticker?.stop?.();
 
-    const sim = new Simulation({
+    const sim = await createComlinkSimulation(Comlink, {
       ...CONFIG.world,
       ...CONFIG.simulation,
       autoGoal: CONFIG.autoGoal,
       onGoal: () => audio.playGoal(),
       onArrival: () => audio.playArrival()
     });
+    CONFIG.telemetry.ipcMode = sim.arena.isShared ? 'SAB + Atomics + Comlink' : 'Comlink + Clone Fallback';
+
     const renderer = new Renderer(app);
     renderer.resetCamera(sim.grid);
 
@@ -1325,8 +1332,8 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
     window.onresize = onResize;
     onResize();
 
-    const { sparkFps, sparkSim, findAgentNear } = setupGUIAndHelpers(sim, renderer);
-    attachInteraction({ canvas, minimapCanvas, sim, renderer, hover, findAgentNear });
+    const { sparkFps, sparkSim, selectAgent, findAgentNear } = setupGUIAndHelpers(sim, renderer);
+    attachInteraction({ canvas, minimapCanvas, sim, renderer, hover, findAgentNear, selectAgent });
 
     let last = performance.now(), frames = 0, fpsTimer = 0;
     const start = last;
@@ -1338,26 +1345,25 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
       frames++;
       fpsTimer += dt;
 
+      sim.syncFromShared();
+
       if (fpsTimer >= 0.5) {
         const curFps = Math.round(frames / fpsTimer);
         CONFIG.telemetry.fps = curFps;
         CONFIG.telemetry.simMs = parseFloat(sim.lastSimDuration.toFixed(1));
+        CONFIG.telemetry.workerTicks = sim.workerTicks;
         CONFIG.telemetry.agentCount = sim.agents.count;
         CONFIG.telemetry.movingCount = sim.agents.count - sim.arrivedAtGoal;
         CONFIG.telemetry.arrivedCount = sim.arrivedAtGoal;
-        CONFIG.telemetry.flowCacheCount = sim.flowCache.entries.size;
-
-        let actCnt = 0;
-        for (let i = 0; i < sim.grid.chunkCount; i++) if (sim.activeStamp[i] === sim.frame) actCnt++;
-        CONFIG.telemetry.activeChunks = actCnt;
+        CONFIG.telemetry.flowCacheCount = sim.flowCacheSize;
+        CONFIG.telemetry.activeChunks = sim.activeChunkCount;
 
         sparkFps.push(curFps);
         sparkSim.push(sim.lastSimDuration);
 
         if (CONFIG.autoGoal.enabled && sim.goal) {
-          const pct = (sim.agents.count > 0 ? (sim.arrivedAtGoal / sim.agents.count) : 0);
-          const rem = Math.max(0, CONFIG.autoGoal.interval - sim.autoGoalTimer).toFixed(0);
-          CONFIG.telemetry.autoGoalTimer = `${rem}s (${Math.round(pct * 100)}% arr)`;
+          const pct = sim.agents.count > 0 ? (sim.arrivedAtGoal / sim.agents.count) : 0;
+          CONFIG.telemetry.autoGoalTimer = `${sim.autoGoalTimerRem.toFixed(0)}s (${Math.round(pct * 100)}% arr)`;
         } else {
           CONFIG.telemetry.autoGoalTimer = CONFIG.autoGoal.enabled ? 'Active' : 'Disabled';
         }
@@ -1387,7 +1393,6 @@ canvas#canvas { display: block; width: 100%; height: 100%; cursor: crosshair; to
         fpsTimer = 0;
       }
 
-      if (!CONFIG.simulation.paused) sim.update(dt);
       renderer.render(sim, CONFIG.telemetry.selectedId, hover, (now - start) / 1000);
       requestAnimationFrame(loop);
     };
